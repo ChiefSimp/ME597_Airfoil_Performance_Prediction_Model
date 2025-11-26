@@ -1,134 +1,557 @@
-# data_acquisition.py
+#!/usr/bin/env python
+# coding: utf-8
 
-import time
+# In[ ]:
+
+
+"""
+airfoil_full_all_airfoils.py
+
+One-file pipeline that:
+- Discovers (almost) all airfoils on AirfoilTools.
+- Fetches geometry + polars for each airfoil.
+- Extracts geometry features and polar summary features.
+- Builds a ML-ready dataset and saves it as:
+
+    airfoil_dataset_all_airfoils.csv
+"""
+
+from pathlib import Path
+from typing import Dict, List, Optional, Set
+
 import io
-import requests
+import time
+
 import numpy as np
 import pandas as pd
-from bs4 import BeautifulSoup
+import requests
 
-AIRFOILTOOLS_BASE = "https://airfoiltools.com"
+# BeautifulSoup with helpful error if missing
+try:
+    from bs4 import BeautifulSoup
+except ImportError as e:
+    raise ImportError(
+        "The 'bs4' package is not installed.\n"
+        "Install it with:\n"
+        "  conda install -c conda-forge beautifulsoup4\n"
+        "or\n"
+        "  python -m pip install beautifulsoup4\n"
+    ) from e
+
+
+# --------------------------------------------------------------------
+# BASIC CONFIG
+# --------------------------------------------------------------------
+
+AIRFOILTOOLS_BASE = "http://airfoiltools.com"
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; airfoil-ml-bot/0.1; +https://github.com/your-repo)"
+    "User-Agent": "Mozilla/5.0 (compatible; airfoil-ml-bot/0.1)"
 }
 
 session = requests.Session()
 session.headers.update(HEADERS)
 
+# For testing, set MAX_AIRFOILS to a small number (e.g., 10).
+# For full run over everything, set MAX_AIRFOILS = None.
+MAX_AIRFOILS: Optional[int] = None
 
-def safe_get(url, params=None, sleep=0.5):
-    """Wrapper around requests.get with basic error handling and optional delay."""
-    time.sleep(sleep)  # be polite
-    resp = session.get(url, params=params, timeout=15)
-    resp.raise_for_status()
-    return resp
+OUTPUT_CSV = Path("airfoil_dataset_all_airfoils.csv")
+
+
+def safe_get(url: str, params=None, sleep: float = 0.25) -> requests.Response:
+    """
+    Wrapper around requests.get with a small delay and clean errors.
+    Shorter timeout so failed hosts don't stall the whole run.
+    """
+    time.sleep(sleep)
+    try:
+        resp = session.get(url, params=params, timeout=7)
+        resp.raise_for_status()
+        return resp
+    except requests.exceptions.RequestException as e:
+        raise RuntimeError(f"Failed to fetch URL: {url}\nReason: {e}") from e
+
+
+# --------------------------------------------------------------------
+# URL HELPERS
+# --------------------------------------------------------------------
+
+def normalize_url(href: str) -> str:
+    """Make href absolute using AIRFOILTOOLS_BASE if needed."""
+    if href.startswith("http://") or href.startswith("https://"):
+        return href
+    if href.startswith("/"):
+        return AIRFOILTOOLS_BASE + href
+    return AIRFOILTOOLS_BASE + "/" + href.lstrip("/")
 
 
 def build_airfoil_details_url(airfoil_id: str) -> str:
-    """
-    Airfoil details page, e.g.
-    https://airfoiltools.com/airfoil/details?airfoil=naca2412-il
-    """
     return f"{AIRFOILTOOLS_BASE}/airfoil/details?airfoil={airfoil_id}"
 
 
-def build_airfoil_dat_url(airfoil_id: str) -> str:
-    """
-    URL to the coordinate .dat file.
-
-    On AirfoilTools, the details page usually has a link to a .dat file.
-    For many airfoils, it's something like:
-      https://airfoiltools.com/airfoil/coords?airfoil=naca2412-il
-
-    You MUST confirm this by inspecting the actual page and update if needed.
-    """
-    return f"{AIRFOILTOOLS_BASE}/airfoil/coords?airfoil={airfoil_id}"  # <-- confirm pattern
+def build_polar_csv_url(polar_id: str) -> str:
+    return f"{AIRFOILTOOLS_BASE}/polar/csv?polar={polar_id}"
 
 
-def fetch_airfoil_coords(airfoil_id: str) -> pd.DataFrame:
+# --------------------------------------------------------------------
+# DISCOVER ALL AIRFOILS
+# --------------------------------------------------------------------
+
+def discover_all_airfoil_ids() -> List[str]:
     """
-    Download airfoil coordinates from AirfoilTools and return as DataFrame with columns ['x', 'y'].
+    Crawl AirfoilTools "airfoil list" pages to collect all airfoil IDs.
+
+    Strategy:
+    - Start from /search/airfoils (known "Airfoil database list" URL).
+    - DFS/BFS through any /search/airfoils* pages found.
+    - On each page, capture any links that look like:
+          ...airfoil/details?airfoil=<id>
     """
-    url = build_airfoil_dat_url(airfoil_id)
-    resp = safe_get(url)
-    text = resp.text
+    start_url = f"{AIRFOILTOOLS_BASE}/search/airfoils"
+    to_visit: List[str] = [start_url]
+    visited_pages: Set[str] = set()
+    airfoil_ids: Set[str] = set()
+
+    print(f"[INFO] Starting airfoil ID discovery from: {start_url}")
+
+    while to_visit:
+        url = to_visit.pop()
+        if url in visited_pages:
+            continue
+        visited_pages.add(url)
+
+        print(f"[INFO] Visiting list page: {url}")
+        try:
+            resp = safe_get(url)
+        except Exception as e:
+            print(f"[WARN] Failed to fetch list page {url}: {e}")
+            continue
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+
+            # 1) collect airfoil IDs from details links
+            if "airfoil/details?airfoil=" in href:
+                part = href.split("airfoil=")[-1]
+                part = part.split("&")[0]
+                airfoil_id = part.strip()
+                if airfoil_id:
+                    airfoil_ids.add(airfoil_id)
+
+            # 2) discover more list pages (/search/airfoils with params)
+            if "search/airfoils" in href:
+                next_url = normalize_url(href)
+                if next_url not in visited_pages:
+                    to_visit.append(next_url)
+
+    airfoil_list = sorted(airfoil_ids)
+    print(f"[INFO] Discovered {len(airfoil_list)} airfoil IDs total.")
+    return airfoil_list
+
+
+# --------------------------------------------------------------------
+# COORDINATE FETCHING
+# --------------------------------------------------------------------
+
+def find_coords_dat_url(airfoil_id: str) -> str:
+    """
+    Parse the airfoil details page and find a .dat link for coordinates.
+    Often this points to the UIUC (m-selig) database.
+    """
+    details_url = build_airfoil_details_url(airfoil_id)
+    print(f"[INFO] Fetching airfoil details page:\n  {details_url}")
+    resp = safe_get(details_url)
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    candidates: List[str] = []
+
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if href.endswith(".dat") or "coord" in href.lower():
+            candidates.append(href)
+
+    candidates = list(set(candidates))
+
+    if not candidates:
+        raise RuntimeError(f"No .dat/coord links found for airfoil {airfoil_id}.")
+
+    chosen: Optional[str] = None
+    for c in candidates:
+        if c.endswith(".dat"):
+            chosen = c
+            break
+    if chosen is None:
+        chosen = candidates[0]
+
+    dat_url = normalize_url(chosen)
+    print(f"[INFO] Using coords .dat URL:\n  {dat_url}")
+    return dat_url
+
+
+def parse_coords_text_to_df(text: str) -> pd.DataFrame:
+    """
+    Robustly parse coords text into DataFrame ['x', 'y'].
+    """
+    xs = []
+    ys = []
+
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+
+        try:
+            x = float(parts[0])
+            y = float(parts[1])
+        except ValueError:
+            continue
+
+        xs.append(x)
+        ys.append(y)
+
+    if not xs:
+        raise RuntimeError("No numeric coordinate lines found in .dat text.")
+
+    return pd.DataFrame({"x": xs, "y": ys})
+
+
+def fetch_airfoil_coords(airfoil_id: str) -> Optional[pd.DataFrame]:
+    """
+    High-level:
+    - locate coord .dat URL
+    - download
+    - parse into DataFrame ['x', 'y'] + airfoil_id
+
+    On any failure (timeout, 404, bad format), returns None so caller can skip.
+    """
+    try:
+        dat_url = find_coords_dat_url(airfoil_id)
+    except Exception as e:
+        print(f"[WARN] Could not find coord .dat URL for {airfoil_id}: {e}")
+        return None
 
     try:
-        data = np.loadtxt(io.StringIO(text), comments="#", skiprows=1)
-    except Exception:
-        data = np.loadtxt(io.StringIO(text), comments="#", skiprows=0)
+        resp = safe_get(dat_url)
+        text = resp.text
+        df = parse_coords_text_to_df(text)
+        df["airfoil_id"] = airfoil_id
+        return df
+    except Exception as e:
+        print(f"[WARN] Failed to fetch/parse coords for {airfoil_id}: {e}")
+        return None
 
-    if data.ndim == 1:
-        data = data.reshape(-1, 2)
 
-    df = pd.DataFrame(data, columns=["x", "y"])
-    return df
+# --------------------------------------------------------------------
+# POLAR DISCOVERY + FETCHING
+# --------------------------------------------------------------------
 
-
-def discover_polar_ids_for_airfoil(airfoil_id: str):
+def discover_polar_ids_for_airfoil(airfoil_id: str) -> List[str]:
     """
-    Given an airfoil (e.g., 'naca2412-il'), parse its details page
-    and extract the available polar IDs (e.g., 'xf-naca2412-il-50000').
-
-    TODO: Inspect the HTML of the airfoil details page in a browser and
-    adapt the parsing logic to the actual structure.
+    Parse airfoil details page and extract available polar IDs.
+    Ex: 'xf-naca2412-il-100000'
     """
     url = build_airfoil_details_url(airfoil_id)
     resp = safe_get(url)
     soup = BeautifulSoup(resp.text, "html.parser")
 
-    polar_ids = []
+    polar_ids: List[str] = []
 
-    # Example placeholder logic:
     for a in soup.find_all("a", href=True):
         href = a["href"]
         if "polar/details?polar=" in href:
             pol = href.split("polar=")[-1]
+            pol = pol.split("&")[0]
             polar_ids.append(pol)
 
-    return list(sorted(set(polar_ids)))
+    polar_ids = sorted(set(polar_ids))
+    return polar_ids
 
 
-def build_polar_details_url(polar_id: str) -> str:
+def parse_polar_text_to_df(text: str) -> pd.DataFrame:
     """
-    Polar details page, e.g.
-    https://airfoiltools.com/polar/details?polar=xf-naca2412-il-50000
+    Parse polar 'CSV' text into DataFrame.
+
+    Strategy:
+    - skip blank/comment/header lines
+    - keep lines where first 2 tokens are numeric
+    - typical format:
+        alpha  cl  cd  cdp  cm  top_xtr  bot_xtr
     """
-    return f"{AIRFOILTOOLS_BASE}/polar/details?polar={polar_id}"
-
-
-def fetch_polar_table(polar_id: str) -> pd.DataFrame:
-    """
-    Fetch the Cl, Cd, Cm vs alpha table from a polar details page.
-
-    TODO: Inspect the HTML structure of the polar page and adjust table selection logic.
-    """
-    url = build_polar_details_url(polar_id)
-    resp = safe_get(url)
-    soup = BeautifulSoup(resp.text, "html.parser")
-
-    table = soup.find("table")
-    if table is None:
-        raise RuntimeError(f"No table found for polar {polar_id}")
-
-    header_row = table.find("tr")
-    headers = [th.get_text(strip=True).lower() for th in header_row.find_all("th")]
-
     rows = []
-    for tr in table.find_all("tr")[1:]:
-        tds = tr.find_all("td")
-        if not tds:
+
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
             continue
-        row = [td.get_text(strip=True) for td in tds]
-        if len(row) != len(headers):
+        if line.startswith("#") or line.lower().startswith("polar"):
             continue
-        rows.append(row)
 
-    df = pd.DataFrame(rows, columns=headers)
+        parts = line.replace(",", " ").split()
+        if len(parts) < 2:
+            continue
 
-    # Try converting columns to numeric when possible
-    for col in df.columns:
-        df[col] = pd.to_numeric(df[col], errors="ignore")
+        try:
+            float(parts[0])
+            float(parts[1])
+        except ValueError:
+            continue
 
+        rows.append(parts)
+
+    if not rows:
+        raise RuntimeError("No numeric data rows found in polar text.")
+
+    ncols = len(rows[0])
+    rows = [r[:ncols] for r in rows]
+    arr = np.array(rows, dtype=float)
+
+    base_cols = ["alpha", "cl", "cd", "cdp", "cm", "top_xtr", "bot_xtr"]
+    cols = base_cols[:ncols]
+
+    return pd.DataFrame(arr, columns=cols)
+
+
+def fetch_single_polar(polar_id: str) -> pd.DataFrame:
+    """
+    Fetch and parse a single polar via the CSV endpoint.
+    Returns DataFrame with numeric columns and `polar_id`.
+    """
+    csv_url = build_polar_csv_url(polar_id)
+    print(f"[INFO] Fetching polar CSV:\n  {csv_url}")
+    resp = safe_get(csv_url)
+    text = resp.text
+
+    df = parse_polar_text_to_df(text)
+    df["polar_id"] = polar_id
     return df
+
+
+def fetch_all_polars_for_airfoil(
+    airfoil_id: str,
+    max_polars: Optional[int] = None,
+) -> pd.DataFrame:
+    """
+    Discover all polar IDs for an airfoil, fetch each, and combine.
+    """
+    polar_ids = discover_polar_ids_for_airfoil(airfoil_id)
+    print(f"[INFO] Found {len(polar_ids)} polar IDs for {airfoil_id}.")
+    if max_polars is not None:
+        polar_ids = polar_ids[:max_polars]
+        print(f"[INFO] Restricting to first {len(polar_ids)} polar IDs.")
+
+    all_dfs = []
+    for pid in polar_ids:
+        try:
+            df = fetch_single_polar(pid)
+            df["airfoil_id"] = airfoil_id
+            all_dfs.append(df)
+        except Exception as e:
+            print(f"[WARN] Failed to fetch polar {pid}: {e}")
+
+    if not all_dfs:
+        raise RuntimeError(f"No polar data fetched for airfoil {airfoil_id}.")
+
+    return pd.concat(all_dfs, ignore_index=True)
+
+
+# --------------------------------------------------------------------
+# GEOMETRIC FEATURES FROM COORDS
+# --------------------------------------------------------------------
+
+def compute_geometry_features(coords_df: pd.DataFrame) -> Dict[str, float]:
+    """
+    Given coords DataFrame ['x', 'y'], compute:
+    - max_thickness
+    - x_at_max_thickness
+    - max_camber
+    - x_at_max_camber
+    """
+    df = coords_df[["x", "y"]].copy()
+    df = df.sort_values("x")
+
+    df["x_round"] = df["x"].round(3)
+    grouped = df.groupby("x_round")
+
+    upper = grouped["y"].max()
+    lower = grouped["y"].min()
+
+    x_vals = upper.index.to_numpy(dtype=float)
+    thickness = (upper - lower).to_numpy()
+    camber = ((upper + lower) / 2.0).to_numpy()
+
+    idx_tmax = np.argmax(thickness)
+    max_thickness = float(thickness[idx_tmax])
+    x_at_max_thickness = float(x_vals[idx_tmax])
+
+    idx_cmax = np.argmax(np.abs(camber))
+    max_camber = float(camber[idx_cmax])
+    x_at_max_camber = float(x_vals[idx_cmax])
+
+    return {
+        "max_thickness": max_thickness,
+        "x_at_max_thickness": x_at_max_thickness,
+        "max_camber": max_camber,
+        "x_at_max_camber": x_at_max_camber,
+    }
+
+
+# --------------------------------------------------------------------
+# POLAR SUMMARY FEATURES
+# --------------------------------------------------------------------
+
+def parse_reynolds_from_polar_id(polar_id: str) -> Optional[float]:
+    """
+    Try to extract Reynolds number from polar_id.
+    """
+    parts = polar_id.split("-")
+    numeric_chunks = [p for p in parts if p.isdigit()]
+
+    if not numeric_chunks:
+        return None
+
+    try:
+        return float(numeric_chunks[-1])
+    except ValueError:
+        return None
+
+
+def summarize_single_polar(polar_df: pd.DataFrame) -> Dict[str, float]:
+    """
+    Given polar_df (alpha, cl, ...), compute:
+    - max_cl
+    - alpha_at_max_cl
+    - cl_alpha_slope (approx dCl/dalpha near linear region)
+    """
+    if "alpha" not in polar_df.columns or "cl" not in polar_df.columns:
+        raise ValueError("polar_df must have 'alpha' and 'cl' columns")
+
+    alpha = pd.to_numeric(polar_df["alpha"], errors="coerce")
+    cl = pd.to_numeric(polar_df["cl"], errors="coerce")
+
+    mask = alpha.notna() & cl.notna()
+    alpha = alpha[mask]
+    cl = cl[mask]
+
+    if alpha.empty:
+        raise ValueError("No valid alpha/cl data in polar.")
+
+    idx_max = cl.idxmax()
+    max_cl = float(cl.loc[idx_max])
+    alpha_at_max_cl = float(alpha.loc[idx_max])
+
+    # Linear range approx: -5 to +10 deg
+    lin_mask = (alpha >= -5.0) & (alpha <= 10.0)
+    alpha_lin = alpha[lin_mask]
+    cl_lin = cl[lin_mask]
+
+    if len(alpha_lin) >= 3:
+        A = np.vstack([alpha_lin.to_numpy(), np.ones_like(alpha_lin.to_numpy())]).T
+        m, b = np.linalg.lstsq(A, cl_lin.to_numpy(), rcond=None)[0]
+        cl_alpha_slope = float(m)
+    else:
+        cl_alpha_slope = float("nan")
+
+    return {
+        "max_cl": max_cl,
+        "alpha_at_max_cl": alpha_at_max_cl,
+        "cl_alpha_slope": cl_alpha_slope,
+    }
+
+
+# --------------------------------------------------------------------
+# DATASET BUILDER
+# --------------------------------------------------------------------
+
+def build_dataset(airfoil_ids: List[str]) -> pd.DataFrame:
+    """
+    Loop over airfoils, assemble dataset with
+    geometry features + polar summary per polar_id.
+    """
+    all_rows = []
+
+    for i, airfoil_id in enumerate(airfoil_ids, start=1):
+        print("\n==============================")
+        print(f"[INFO] ({i}/{len(airfoil_ids)}) Processing airfoil: {airfoil_id}")
+        print("==============================")
+
+        # 1) coords + geom features
+        coords_df = fetch_airfoil_coords(airfoil_id)
+        if coords_df is None:
+            print(f"[WARN] Skipping {airfoil_id} (no coords available).")
+            continue
+
+        try:
+            geom_feats = compute_geometry_features(coords_df)
+        except Exception as e:
+            print(f"[WARN] Failed to compute geometry for {airfoil_id}: {e}")
+            continue
+
+        # 2) all polars
+        try:
+            polars_df = fetch_all_polars_for_airfoil(airfoil_id, max_polars=None)
+        except Exception as e:
+            print(f"[WARN] Failed to fetch polars for {airfoil_id}: {e}")
+            continue
+
+        if "polar_id" not in polars_df.columns:
+            print(f"[WARN] polars_df missing 'polar_id' for {airfoil_id}")
+            continue
+
+        # 3) summarize each polar
+        for polar_id, grp in polars_df.groupby("polar_id"):
+            try:
+                polar_summary = summarize_single_polar(grp)
+            except Exception as e:
+                print(f"[WARN] Skipping polar {polar_id} for {airfoil_id}: {e}")
+                continue
+
+            Re = parse_reynolds_from_polar_id(polar_id)
+
+            row = {
+                "airfoil_id": airfoil_id,
+                "polar_id": polar_id,
+                "Re": Re,
+            }
+            row.update(geom_feats)
+            row.update(polar_summary)
+            all_rows.append(row)
+
+    if not all_rows:
+        raise RuntimeError("No data rows generated. Check connectivity / IDs.")
+
+    dataset = pd.DataFrame(all_rows)
+    return dataset
+
+
+def main():
+    # 1) Discover all airfoil IDs
+    airfoil_ids = discover_all_airfoil_ids()
+
+    if MAX_AIRFOILS is not None:
+        airfoil_ids = airfoil_ids[:MAX_AIRFOILS]
+        print(f"[INFO] Limiting to first {len(airfoil_ids)} airfoils for this run.")
+
+    print(f"[INFO] Will process {len(airfoil_ids)} airfoils.")
+
+    # 2) Build dataset
+    dataset = build_dataset(airfoil_ids)
+
+    print("\n[INFO] Dataset built.")
+    print(dataset.head())
+
+    OUTPUT_CSV.parent.mkdir(parents=True, exist_ok=True)
+    dataset.to_csv(OUTPUT_CSV, index=False)
+    print(f"[INFO] Dataset saved to: {OUTPUT_CSV.resolve()}")
+
+
+if __name__ == "__main__":
+    main()
+
+
