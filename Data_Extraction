@@ -1,9 +1,3 @@
-#!/usr/bin/env python
-# coding: utf-8
-
-# In[ ]:
-
-
 """
 airfoil_full_all_airfoils.py
 
@@ -54,7 +48,7 @@ session.headers.update(HEADERS)
 
 # For testing, set MAX_AIRFOILS to a small number (e.g., 10).
 # For full run over everything, set MAX_AIRFOILS = None.
-MAX_AIRFOILS: Optional[int] = None
+MAX_AIRFOILS: Optional[int] = 10
 
 OUTPUT_CSV = Path("airfoil_dataset_all_airfoils.csv")
 
@@ -471,8 +465,10 @@ def summarize_single_polar(polar_df: pd.DataFrame) -> Dict[str, float]:
 
 def build_dataset(airfoil_ids: List[str]) -> pd.DataFrame:
     """
-    Loop over airfoils, assemble dataset with
-    geometry features + polar summary per polar_id.
+    Loop over airfoils and assemble a dataset with:
+    - geometry features (repeated for each polar sample)
+    - raw polar values for each row where alpha > 0:
+        alpha, cl, cd, cdp, cm, top_xtr, bot_xtr
     """
     all_rows = []
 
@@ -504,23 +500,38 @@ def build_dataset(airfoil_ids: List[str]) -> pd.DataFrame:
             print(f"[WARN] polars_df missing 'polar_id' for {airfoil_id}")
             continue
 
-        # 3) summarize each polar
-        for polar_id, grp in polars_df.groupby("polar_id"):
-            try:
-                polar_summary = summarize_single_polar(grp)
-            except Exception as e:
-                print(f"[WARN] Skipping polar {polar_id} for {airfoil_id}: {e}")
-                continue
+        # Make sure alpha is numeric so we can filter properly
+        polars_df = polars_df.copy()
+        polars_df["alpha"] = pd.to_numeric(polars_df["alpha"], errors="coerce")
 
+        # 3) keep only rows with alpha > 0
+        mask = polars_df["alpha"].notna() & (polars_df["alpha"] > 0.0)
+        polars_df = polars_df[mask]
+
+        if polars_df.empty:
+            print(f"[WARN] No polar rows with alpha > 0 for {airfoil_id}.")
+            continue
+
+        # 4) each row in polars_df becomes one row in the dataset
+        for _, r in polars_df.iterrows():
+            polar_id = r["polar_id"]
             Re = parse_reynolds_from_polar_id(polar_id)
 
             row = {
                 "airfoil_id": airfoil_id,
                 "polar_id": polar_id,
                 "Re": Re,
+                "alpha": float(r["alpha"]),
+                "cl": float(r.get("cl", np.nan)),
+                "cd": float(r.get("cd", np.nan)),
+                "cdp": float(r.get("cdp", np.nan)),
+                "cm": float(r.get("cm", np.nan)),
+                "top_xtr": float(r.get("top_xtr", np.nan)),
+                "bot_xtr": float(r.get("bot_xtr", np.nan)),
             }
+
+            # attach geometry features (same for all rows of this airfoil)
             row.update(geom_feats)
-            row.update(polar_summary)
             all_rows.append(row)
 
     if not all_rows:
@@ -553,5 +564,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
